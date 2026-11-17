@@ -14,10 +14,15 @@ This module handles all three steps transparently.
 
 import tempfile
 
+import httpx
+
 from mcp.server.fastmcp import FastMCP
 
 from ..core.cache import get_course_code, get_course_id
+from ..core.config import get_config
+from ..core.credentials import get_request_credentials, is_oauth_required
 from ..core.client import (
+    OAUTH_REQUIRED_ERROR,
     _get_http_client,
     fetch_all_paginated_results,
     make_canvas_request,
@@ -216,8 +221,17 @@ def register_file_tools(mcp: FastMCP):
         if not save_path.is_relative_to(save_dir):
             return "Error: Invalid filename - path outside allowed directory"
 
-        # Download the file using streaming to handle large files efficiently
-        client = _get_http_client()
+        # Download with the same Canvas identity that fetched the metadata
+        creds = get_request_credentials()
+        if creds is None and is_oauth_required():
+            return f"Error: {OAUTH_REQUIRED_ERROR}"
+        if creds is not None:
+            client = httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {creds.api_token}"},
+                timeout=get_config().api_timeout,
+            )
+        else:
+            client = _get_http_client()
         try:
             total_bytes = 0
             async with client.stream("GET", download_url, follow_redirects=True) as response:
@@ -240,6 +254,9 @@ def register_file_tools(mcp: FastMCP):
 
         except Exception as e:
             return f"Error downloading file: {str(e)}"
+        finally:
+            if creds is not None:
+                await client.aclose()
 
     @mcp.tool()
     @validate_params

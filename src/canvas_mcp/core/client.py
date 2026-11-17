@@ -1,12 +1,11 @@
 """HTTP client and Canvas API utilities."""
-import os
 import asyncio
 from typing import Any
 from urllib.parse import urlencode
 import httpx
 
 from .anonymization import anonymize_response_data
-from .credentials import get_request_credentials
+from .credentials import get_request_credentials, is_oauth_required
 from .logging import log_debug, log_error, log_warning, sanitize_url
 
 # Rate limit retry configuration
@@ -21,7 +20,11 @@ http_client: httpx.AsyncClient | None = None
 
 # Concurrency limiter for outbound Canvas API calls
 _request_semaphore: asyncio.Semaphore | None = None
-_token_refresh_lock = asyncio.Lock()
+
+OAUTH_REQUIRED_ERROR = (
+    "Not authenticated with Canvas. Reconnect this MCP server to sign in "
+    "with your Canvas account."
+)
 
 
 def _get_request_semaphore() -> asyncio.Semaphore:
@@ -116,63 +119,6 @@ async def cleanup_http_client() -> None:
         http_client = None
 
 
-async def get_new_access_token(failed_access_token: str | None = None) -> str | None:
-    """Silently refresh the server's Canvas OAuth access token.
-
-    This function is intentionally for the server-wide credential only.  A
-    request supplied with ``X-Canvas-Token`` belongs to the caller and must
-    never be replaced with the server's refresh-token-derived credential.
-    """
-    from .config import get_config
-
-    config = get_config()
-    canvas_url = os.getenv("CANVAS_BASE_URL", "").rstrip("/")
-    if not canvas_url:
-        canvas_url = config.canvas_api_url.rstrip("/").removesuffix("/api/v1")
-    client_id = os.getenv("CANVAS_CLIENT_ID")
-    client_secret = os.getenv("CANVAS_CLIENT_SECRET")
-    refresh_token = os.getenv("CANVAS_REFRESH_TOKEN")
-
-    if not all([canvas_url, client_id, client_secret, refresh_token]):
-        return None
-
-    async with _token_refresh_lock:
-        # Another request may have completed the refresh while this one waited.
-        if failed_access_token and config.canvas_api_token != failed_access_token:
-            return config.canvas_api_token
-
-        payload = {
-            "grant_type": "refresh_token",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-        }
-        redirect_uri = os.getenv("CANVAS_OAUTH_REDIRECT_URI")
-        if redirect_uri:
-            payload["redirect_uri"] = redirect_uri
-
-        url = f"{canvas_url}/login/oauth2/token"
-        try:
-            async with httpx.AsyncClient() as refresh_client:
-                response = await refresh_client.post(url, data=payload)
-                response.raise_for_status()
-
-            new_token = response.json().get("access_token")
-            if not isinstance(new_token, str) or not new_token:
-                log_error("Canvas OAuth refresh response did not contain an access token")
-                return None
-
-            # Keep every server-side consumer in sync, including code execution.
-            os.environ["CANVAS_API_TOKEN"] = new_token
-            config.canvas_api_token = new_token
-            if http_client is not None and not http_client.is_closed:
-                http_client.headers["Authorization"] = f"Bearer {new_token}"
-            return new_token
-        except httpx.HTTPError as exc:
-            log_error("Canvas OAuth token refresh failed", error_type=type(exc).__name__)
-            return None
-
-
 async def make_canvas_request(
     method: str,
     endpoint: str,
@@ -206,8 +152,12 @@ async def make_canvas_request(
     if not endpoint.startswith('/'):
         endpoint = f"/{endpoint}"
 
+    if req_creds is None and is_oauth_required():
+        # Never fall back to the server-wide token for an OAuth deployment.
+        return {"error": OAUTH_REQUIRED_ERROR}
+
     if req_creds:
-        # Per-request client with user's credentials (HTTP mode)
+        # Per-request client with the signed-in user's Canvas token
         from .. import __version__
 
         client = httpx.AsyncClient(
@@ -230,7 +180,6 @@ async def make_canvas_request(
     async with semaphore:
         # Retry loop for rate limiting
         try:
-            token_refresh_attempted = False
             for attempt in range(MAX_RETRIES + 1):
                 try:
                     # Log the request for debugging (if enabled)
@@ -316,35 +265,12 @@ async def make_canvas_request(
                         await asyncio.sleep(wait_time)
                         continue
 
-                    # Refresh only the server credential.  Per-request Canvas
-                    # tokens are owned by the caller, so using this server's
-                    # refresh token there would cross account boundaries.
-                    can_refresh_server_token = (
-                        req_creds is None
-                        and not token_refresh_attempted
-                        and e.response.status_code == 401
-                        and bool(e.response.headers.get("WWW-Authenticate"))
-                    )
-                    if can_refresh_server_token:
-                        token_refresh_attempted = True
-                        log_warning("Token expired (401). Attempting to refresh...",
-                                    attempt=attempt + 1, max_retries=MAX_RETRIES)
+                    if e.response.status_code == 401 and req_creds is not None:
+                        # The user's Canvas token was revoked or expired;
+                        # the MCP client must refresh or sign in again.
+                        log_data_access(method, endpoint, "error", "HTTP error: 401")
+                        return {"error": f"HTTP error: 401. {OAUTH_REQUIRED_ERROR}"}
 
-                        new_token = await get_new_access_token(
-                            failed_access_token=config.canvas_api_token
-                        )
-
-                        if new_token:
-                            # Update the active client's headers so the retry uses the new token
-                            client.headers["Authorization"] = f"Bearer {new_token}"
-                            log_warning(
-                                "Successfully refreshed token! Retrying request...")
-                            continue  # Jump back to the top of the loop and try the API call again!
-                        else:
-                            log_error(
-                                "Could not refresh OAuth token. Check your .env variables.")
-                    # Not rate-limited, not a refreshable server token, or a
-                    # failed refresh: return the actual HTTP error now.
                     error_message = f"HTTP error: {e.response.status_code}"
                     log_data_access(method, endpoint, "error", error_message)
                     return {"error": error_message}
@@ -454,6 +380,8 @@ async def upload_file_to_storage(
                             confirm_response = await canvas_client.get(redirect_url)
                             confirm_response.raise_for_status()
                             return confirm_response.json()
+                    elif is_oauth_required():
+                        return {"error": OAUTH_REQUIRED_ERROR}
                     else:
                         canvas_client = _get_http_client()
                         confirm_response = await canvas_client.get(redirect_url)

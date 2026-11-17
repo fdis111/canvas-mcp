@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 from ..core.config import get_config
+from ..core.credentials import RequestCredentials, resolve_canvas_credentials
 from ..core.logging import log_warning
 from ..core.validation import validate_params
 
@@ -30,20 +31,23 @@ _SAFE_ENV_KEYS = frozenset({
 })
 
 
-def _build_safe_env(config: Any) -> dict[str, str]:
+def _build_safe_env(
+    config: Any, creds: RequestCredentials | None = None
+) -> dict[str, str]:
     """Build a filtered environment dict for subprocess execution.
 
     Only passes through keys in _SAFE_ENV_KEYS, plus explicitly adds
-    CANVAS_API_URL and CANVAS_API_TOKEN from config.
+    CANVAS_API_URL and CANVAS_API_TOKEN from ``creds`` (the signed-in user's
+    Canvas credentials) or, when not given, from config.
     """
     env: dict[str, str] = {}
     for key in _SAFE_ENV_KEYS:
         val = os.environ.get(key)
         if val is not None:
             env[key] = val
-    # Explicitly add Canvas credentials from config
-    env["CANVAS_API_URL"] = config.canvas_api_url
-    env["CANVAS_API_TOKEN"] = config.canvas_api_token
+    # Explicitly add Canvas credentials
+    env["CANVAS_API_URL"] = creds.api_url if creds else config.canvas_api_url
+    env["CANVAS_API_TOKEN"] = creds.api_token if creds else config.canvas_api_token
     return env
 
 
@@ -265,6 +269,13 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
         config = get_config()
         warnings: list[str] = []
 
+        canvas_creds = resolve_canvas_credentials()
+        if canvas_creds is None:
+            return json.dumps({
+                "error": "No Canvas credentials available. Sign in with your "
+                "Canvas account (OAuth) or set CANVAS_API_TOKEN."
+            })
+
         sandbox_enabled = config.enable_ts_sandbox
         sandbox_mode_setting = config.ts_sandbox_mode
         if sandbox_mode_setting not in {"auto", "local", "container"}:
@@ -272,7 +283,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
 
         block_outbound = config.ts_sandbox_block_outbound_network
         allowlist_hosts = _parse_allowlist_hosts(config.ts_sandbox_allowlist_hosts)
-        canvas_host = _normalize_host(config.canvas_api_url)
+        canvas_host = _normalize_host(canvas_creds.api_url)
         if sandbox_enabled and block_outbound and canvas_host:
             if canvas_host not in allowlist_hosts:
                 allowlist_hosts.append(canvas_host)
@@ -377,7 +388,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
             exec_start = time.monotonic()
 
             # Prepare filtered environment variables (allowlist only)
-            env = _build_safe_env(config)
+            env = _build_safe_env(config, canvas_creds)
             if node_options_local:
                 env["NODE_OPTIONS"] = node_options_local
 
@@ -414,9 +425,9 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
                     "-w",
                     "/workspace",
                     "-e",
-                    f"CANVAS_API_URL={config.canvas_api_url}",
+                    f"CANVAS_API_URL={canvas_creds.api_url}",
                     "-e",
-                    f"CANVAS_API_TOKEN={config.canvas_api_token}",
+                    f"CANVAS_API_TOKEN={canvas_creds.api_token}",
                 ])
                 if node_options_container:
                     cmd.extend(["-e", f"NODE_OPTIONS={node_options_container}"])
