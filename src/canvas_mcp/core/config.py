@@ -33,6 +33,15 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _list_env_spaces(name: str) -> list[str]:
+    """Return a whitespace-separated environment variable as a list.
+
+    Canvas scopes contain no spaces but may contain commas, so they must not be
+    split on commas.
+    """
+    return os.getenv(name, "").split()
+
+
 def _list_env(name: str) -> list[str]:
     """Return a comma- or whitespace-separated environment variable as a list."""
     value = os.getenv(name, "")
@@ -92,30 +101,35 @@ class Config:
         self.ts_sandbox_timeout_sec = _int_env("TS_SANDBOX_TIMEOUT_SEC", 120)
         self.ts_sandbox_container_image = os.getenv("TS_SANDBOX_CONTAINER_IMAGE", "node:20-alpine")
 
-        # MCP client authentication for the streamable HTTP transport.  The
-        # server acts as an OAuth proxy in front of an existing OIDC provider;
-        # this keeps Canvas credentials server-side and gives MCP clients a
-        # standards-compliant OAuth 2.1 flow.
+        # MCP client authentication for the streamable HTTP transport.
+        # With MCP_AUTH_MODE=canvas the server is an OAuth 2.1 proxy in front of
+        # Canvas itself: users sign in with their Canvas account and every
+        # tool call runs with that user's own Canvas access token.
         self.mcp_auth_mode = os.getenv("MCP_AUTH_MODE", "none").strip().lower()
         self.mcp_public_url = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
-        self.mcp_oidc_config_url = os.getenv("MCP_OIDC_CONFIG_URL", "")
-        self.mcp_oidc_client_id = os.getenv("MCP_OIDC_CLIENT_ID", "")
-        self.mcp_oidc_client_secret = os.getenv("MCP_OIDC_CLIENT_SECRET", "")
-        self.mcp_oidc_audience = os.getenv("MCP_OIDC_AUDIENCE", "")
-        self.mcp_oidc_required_scopes = _list_env("MCP_OIDC_REQUIRED_SCOPES")
-        self.mcp_oidc_redirect_path = os.getenv(
-            "MCP_OIDC_REDIRECT_PATH", "/auth/callback"
+        self.mcp_jwt_signing_key = os.getenv("MCP_JWT_SIGNING_KEY", "")
+        self.mcp_allowed_client_redirect_uris = _list_env(
+            "MCP_ALLOWED_CLIENT_REDIRECT_URIS"
         )
-        self.mcp_oidc_allowed_client_redirect_uris = _list_env(
-            "MCP_OIDC_ALLOWED_CLIENT_REDIRECT_URIS"
+        self.mcp_oauth_redirect_path = os.getenv(
+            "MCP_OAUTH_REDIRECT_PATH", "/auth/callback"
         )
-        self.mcp_oidc_jwt_signing_key = os.getenv("MCP_OIDC_JWT_SIGNING_KEY", "")
-        self.mcp_oidc_token_endpoint_auth_method = os.getenv(
-            "MCP_OIDC_TOKEN_ENDPOINT_AUTH_METHOD", ""
+        self.mcp_require_authorization_consent = _bool_env(
+            "MCP_REQUIRE_AUTHORIZATION_CONSENT", True
         )
-        self.mcp_oidc_require_authorization_consent = _bool_env(
-            "MCP_OIDC_REQUIRE_AUTHORIZATION_CONSENT", True
+
+        # Canvas OAuth2 Developer Key (Admin > Developer Keys > API Key).
+        self.canvas_base_url = (
+            os.getenv("CANVAS_BASE_URL", "").rstrip("/")
+            or self.canvas_api_url.rstrip("/").removesuffix("/api/v1")
         )
+        self.canvas_oauth_client_id = os.getenv("CANVAS_OAUTH_CLIENT_ID", "")
+        self.canvas_oauth_client_secret = os.getenv("CANVAS_OAUTH_CLIENT_SECRET", "")
+        # Only needed when the Developer Key enforces scopes, e.g.
+        # "url:GET|/api/v1/courses url:GET|/api/v1/users/:user_id/profile".
+        self.canvas_oauth_scopes = _list_env_spaces("CANVAS_OAUTH_SCOPES")
+        self.canvas_oauth_purpose = os.getenv("CANVAS_OAUTH_PURPOSE", "Canvas MCP")
+        self.canvas_oauth_forward_pkce = _bool_env("CANVAS_OAUTH_FORWARD_PKCE", False)
 
         # Optional metadata
         self.institution_name = os.getenv("INSTITUTION_NAME", "")
@@ -164,6 +178,8 @@ def validate_config() -> bool:
         "MCP_BIND_PORT": "MCP uses stdio transport and does not bind network sockets",
         "FIREWALL_HINT": "firewall hints are documentation-only",
     }
+
+    warn_removed_auth_env_vars()
 
     if not config.canvas_api_token:
         log_error("CANVAS_API_TOKEN environment variable is required")
@@ -214,38 +230,74 @@ def validate_config() -> bool:
     return True
 
 
+REMOVED_AUTH_ENV_VARS = {
+    "CANVAS_REFRESH_TOKEN": "the shared server refresh token was replaced by per-user Canvas OAuth (MCP_AUTH_MODE=canvas)",
+    "CANVAS_CLIENT_ID": "renamed to CANVAS_OAUTH_CLIENT_ID",
+    "CANVAS_CLIENT_SECRET": "renamed to CANVAS_OAUTH_CLIENT_SECRET",
+    "CANVAS_OAUTH_REDIRECT_URI": "the redirect URI is now MCP_PUBLIC_URL + MCP_OAUTH_REDIRECT_PATH",
+    "MCP_OIDC_CONFIG_URL": "the external OIDC provider was replaced by Canvas OAuth (MCP_AUTH_MODE=canvas)",
+    "MCP_OIDC_CLIENT_ID": "replaced by CANVAS_OAUTH_CLIENT_ID",
+    "MCP_OIDC_CLIENT_SECRET": "replaced by CANVAS_OAUTH_CLIENT_SECRET",
+    "MCP_OIDC_JWT_SIGNING_KEY": "renamed to MCP_JWT_SIGNING_KEY",
+    "MCP_OIDC_ALLOWED_CLIENT_REDIRECT_URIS": "renamed to MCP_ALLOWED_CLIENT_REDIRECT_URIS",
+}
+
+
+def warn_removed_auth_env_vars() -> None:
+    """Warn about authentication settings that are no longer read."""
+    for env_name, note in REMOVED_AUTH_ENV_VARS.items():
+        if os.getenv(env_name):
+            log_warning(f"{env_name} is set but no longer used: {note}.")
+
+
 def validate_http_auth_config() -> bool:
-    """Validate optional OAuth/OIDC protection for the HTTP MCP endpoint."""
+    """Validate configuration for the streamable HTTP transport."""
     config = get_config()
 
     if config.mcp_auth_mode == "none":
-        return True
+        # Unauthenticated endpoint: every call uses the server's own token.
+        return validate_config()
 
-    if config.mcp_auth_mode != "oidc":
-        log_error("MCP_AUTH_MODE must be either 'none' or 'oidc'")
+    warn_removed_auth_env_vars()
+
+    if config.mcp_auth_mode == "oidc":
+        log_error(
+            "MCP_AUTH_MODE=oidc was removed; use MCP_AUTH_MODE=canvas so users "
+            "sign in with their Canvas account"
+        )
+        return False
+
+    if config.mcp_auth_mode != "canvas":
+        log_error("MCP_AUTH_MODE must be either 'none' or 'canvas'")
         return False
 
     required = {
+        "CANVAS_API_URL": config.canvas_api_url,
         "MCP_PUBLIC_URL": config.mcp_public_url,
-        "MCP_OIDC_CONFIG_URL": config.mcp_oidc_config_url,
-        "MCP_OIDC_CLIENT_ID": config.mcp_oidc_client_id,
-        "MCP_OIDC_CLIENT_SECRET": config.mcp_oidc_client_secret,
-        "MCP_OIDC_JWT_SIGNING_KEY": config.mcp_oidc_jwt_signing_key,
+        "CANVAS_OAUTH_CLIENT_ID": config.canvas_oauth_client_id,
+        "CANVAS_OAUTH_CLIENT_SECRET": config.canvas_oauth_client_secret,
+        "MCP_JWT_SIGNING_KEY": config.mcp_jwt_signing_key,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
         log_error(
-            "OIDC authentication is enabled but required settings are missing: "
+            "Canvas OAuth is enabled but required settings are missing: "
             + ", ".join(missing)
         )
         return False
 
-    if not config.mcp_oidc_allowed_client_redirect_uris:
+    if not config.mcp_allowed_client_redirect_uris:
         log_error(
-            "MCP_OIDC_ALLOWED_CLIENT_REDIRECT_URIS is required when OIDC "
-            "authentication is enabled"
+            "MCP_ALLOWED_CLIENT_REDIRECT_URIS is required when Canvas OAuth "
+            "is enabled"
         )
         return False
+
+    if config.canvas_api_token:
+        log_warning(
+            "CANVAS_API_TOKEN is set but ignored in Canvas OAuth mode; each "
+            "user's own Canvas token is used instead."
+        )
 
     return True
 

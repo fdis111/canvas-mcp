@@ -1,4 +1,4 @@
-"""Tests for HTTP transport: credential middleware, ContextVar flow, and CLI args."""
+"""Tests for HTTP transport: per-request credential flow and CLI args."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,98 +50,6 @@ class TestRequestCredentials:
         creds = RequestCredentials(api_token="t", api_url="u")
         with pytest.raises(AttributeError):
             creds.api_token = "other"  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# ASGI Middleware tests
-# ---------------------------------------------------------------------------
-
-
-class TestCanvasCredentialMiddleware:
-    """Test the ASGI middleware that extracts Canvas headers."""
-
-    @pytest.fixture
-    def middleware(self):
-        from canvas_mcp.server import CanvasCredentialMiddleware
-
-        inner_app = AsyncMock()
-        return CanvasCredentialMiddleware(inner_app)
-
-    @pytest.mark.asyncio
-    async def test_extracts_headers_and_sets_credentials(self, middleware):
-        """Middleware sets ContextVar from X-Canvas-Token and X-Canvas-URL headers."""
-        captured_creds = {}
-
-        async def capture_app(scope, receive, send):
-            creds = get_request_credentials()
-            if creds:
-                captured_creds["token"] = creds.api_token
-                captured_creds["url"] = creds.api_url
-
-        middleware.app = capture_app
-
-        scope = {
-            "type": "http",
-            "headers": [
-                (b"x-canvas-token", b"my-secret-token"),
-                (b"x-canvas-url", b"https://school.instructure.com/api/v1"),
-            ],
-        }
-        await middleware(scope, AsyncMock(), AsyncMock())
-
-        assert captured_creds["token"] == "my-secret-token"
-        assert captured_creds["url"] == "https://school.instructure.com/api/v1"
-        # Credentials should be cleared after request
-        assert get_request_credentials() is None
-
-    @pytest.mark.asyncio
-    async def test_clears_credentials_after_request(self, middleware):
-        """Credentials are cleared even if the inner app raises."""
-        async def failing_app(scope, receive, send):
-            raise ValueError("boom")
-
-        middleware.app = failing_app
-
-        scope = {
-            "type": "http",
-            "headers": [
-                (b"x-canvas-token", b"tok"),
-                (b"x-canvas-url", b"https://x.com/api/v1"),
-            ],
-        }
-        with pytest.raises(ValueError, match="boom"):
-            await middleware(scope, AsyncMock(), AsyncMock())
-
-        # Must be cleaned up despite error
-        assert get_request_credentials() is None
-
-    @pytest.mark.asyncio
-    async def test_no_headers_passes_through(self, middleware):
-        """Without Canvas headers, no credentials are set."""
-        captured_creds = {"set": False}
-
-        async def check_app(scope, receive, send):
-            captured_creds["set"] = get_request_credentials() is not None
-
-        middleware.app = check_app
-
-        scope = {"type": "http", "headers": []}
-        await middleware(scope, AsyncMock(), AsyncMock())
-        assert captured_creds["set"] is False
-
-    @pytest.mark.asyncio
-    async def test_lifespan_passthrough(self, middleware):
-        """Non-HTTP scopes (e.g., lifespan) pass through without credential logic."""
-        called = {"value": False}
-
-        async def inner(scope, receive, send):
-            called["value"] = True
-
-        middleware.app = inner
-
-        scope = {"type": "lifespan"}
-        await middleware(scope, AsyncMock(), AsyncMock())
-        assert called["value"] is True
 
 
 # ---------------------------------------------------------------------------

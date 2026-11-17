@@ -15,17 +15,21 @@ This module handles all three steps transparently.
 import base64
 import tempfile
 
+import httpx
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_code, get_course_id
+from ..core.config import get_config
+from ..core.credentials import get_request_credentials, is_oauth_required
 from ..core.client import (
+    OAUTH_REQUIRED_ERROR,
     _get_http_client,
     fetch_all_paginated_results,
     make_canvas_request,
     upload_file_to_storage,
 )
-from ..core.config import get_config
 from ..core.file_validation import (
     FileValidationResult,
     format_file_size,
@@ -33,6 +37,22 @@ from ..core.file_validation import (
     validate_file_for_upload,
 )
 from ..core.validation import validate_params
+
+
+def _get_file_download_client() -> tuple[httpx.AsyncClient | None, bool]:
+    creds = get_request_credentials()
+    if creds is None:
+        if is_oauth_required():
+            return None, False
+        return _get_http_client(), False
+
+    return (
+        httpx.AsyncClient(
+            headers={"Authorization": "Bearer " + creds.api_token},
+            timeout=get_config().api_timeout,
+        ),
+        True,
+    )
 
 
 def register_shared_file_tools(mcp: FastMCP):
@@ -84,7 +104,9 @@ def register_shared_file_tools(mcp: FastMCP):
             return "Error: Invalid filename - path outside allowed directory"
 
         # Download the file using streaming to handle large files efficiently
-        client = _get_http_client()
+        client, close_client = _get_file_download_client()
+        if client is None:
+            return f"Error: {OAUTH_REQUIRED_ERROR}"
         try:
             total_bytes = 0
             async with client.stream("GET", download_url, follow_redirects=True) as response:
@@ -107,6 +129,9 @@ def register_shared_file_tools(mcp: FastMCP):
 
         except Exception as e:
             return f"Error downloading file: {str(e)}"
+        finally:
+            if close_client:
+                await client.aclose()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     @validate_params
@@ -169,7 +194,9 @@ def register_shared_file_tools(mcp: FastMCP):
             )
 
         # Download the file content into memory
-        client = _get_http_client()
+        client, close_client = _get_file_download_client()
+        if client is None:
+            return f"Error: {OAUTH_REQUIRED_ERROR}"
         try:
             buffer = bytearray()
             async with client.stream("GET", download_url, follow_redirects=True) as response:
@@ -198,6 +225,9 @@ def register_shared_file_tools(mcp: FastMCP):
 
         except Exception as e:
             return f"Error reading file: {str(e)}"
+        finally:
+            if close_client:
+                await client.aclose()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     @validate_params
