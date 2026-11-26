@@ -9,7 +9,8 @@ academic tracking.
 
 Supports two transport modes:
 - stdio (default): Local process communication, credentials from .env
-- streamable-http: HTTP server, per-request credentials via X-Canvas-Token/X-Canvas-URL headers
+- streamable-http: HTTP server; with MCP_AUTH_MODE=canvas each user signs in
+  with their own Canvas account through OAuth 2.1
 """
 
 import argparse
@@ -21,11 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .core.config import get_config, validate_config, validate_http_auth_config
 from .core.mcp_auth import create_mcp_auth_provider, register_mcp_auth_routes
-from .core.credentials import (
-    RequestCredentials,
-    clear_request_credentials,
-    set_request_credentials,
-)
+from .core.credentials import set_oauth_required
 from .core.logging import log_error, log_info, log_warning
 from .resources import register_resources_and_prompts
 from .tools import (
@@ -52,37 +49,6 @@ from .tools import (
     register_shared_module_tools,
     register_student_tools,
 )
-
-
-class CanvasCredentialMiddleware:
-    """ASGI middleware that extracts Canvas credentials from HTTP headers.
-
-    For each incoming HTTP request, reads X-Canvas-Token and X-Canvas-URL
-    headers and sets them in the ContextVar so make_canvas_request uses
-    the caller's credentials instead of the server's .env config.
-    """
-
-    def __init__(self, app: Any) -> None:
-        self.app = app
-
-    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            # Parse headers from ASGI scope (list of [name, value] byte pairs)
-            headers = dict(scope.get("headers", []))
-            token = headers.get(b"x-canvas-token", b"").decode()
-            canvas_url = headers.get(b"x-canvas-url", b"").decode()
-
-            if token and canvas_url:
-                set_request_credentials(
-                    RequestCredentials(api_token=token, api_url=canvas_url)
-                )
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                clear_request_credentials()
-        else:
-            # Passthrough for lifespan and other non-HTTP scopes
-            await self.app(scope, receive, send)
 
 
 def create_server(
@@ -234,18 +200,17 @@ def main() -> None:
     args = parser.parse_args()
     is_http = args.transport == "streamable-http"
 
-    # In HTTP mode, .env credentials are optional (per-request auth instead)
-    if not is_http:
-        if not validate_config():
-            log_error("Please check your .env file configuration")
-            log_error("Use the env.template file as a reference")
-            sys.exit(1)
+    # stdio always uses the .env token.  HTTP either uses Canvas OAuth
+    # (per-user tokens, no CANVAS_API_TOKEN) or, unauthenticated, the .env token.
+    valid = validate_http_auth_config() if is_http else validate_config()
+    if not valid:
+        log_error("Please check your .env file configuration")
+        log_error("Use the env.template file as a reference")
+        sys.exit(1)
 
     config = get_config()
-
-    if is_http and not validate_http_auth_config():
-        log_error("Please check the HTTP MCP authentication configuration")
-        sys.exit(1)
+    use_canvas_oauth = is_http and config.mcp_auth_mode == "canvas"
+    set_oauth_required(use_canvas_oauth)
 
     # Handle special commands
     if args.config:
@@ -257,8 +222,8 @@ def main() -> None:
         if is_http:
             print(f"  Host: {args.host}", file=sys.stderr)
             print(f"  Port: {args.port}", file=sys.stderr)
-        else:
-            print(f"  Canvas API URL: {config.canvas_api_url}", file=sys.stderr)
+            print(f"  Auth Mode: {config.mcp_auth_mode}", file=sys.stderr)
+        print(f"  Canvas API URL: {config.canvas_api_url}", file=sys.stderr)
         print(f"  Debug Mode: {config.debug}", file=sys.stderr)
         print(f"  API Timeout: {config.api_timeout}s", file=sys.stderr)
         print(f"  Cache TTL: {config.cache_ttl}s", file=sys.stderr)
@@ -310,14 +275,17 @@ def main() -> None:
         log_info(
             f"Starting Canvas MCP server in HTTP mode on {args.host}:{args.port}"
         )
-        if config.mcp_auth_mode == "oidc":
-            log_info("MCP client authentication: OAuth 2.1 via upstream OIDC")
+        if use_canvas_oauth:
+            log_info(
+                "Authentication: Canvas OAuth 2.1 — each user signs in with "
+                f"their Canvas account at {config.canvas_base_url}"
+            )
         else:
             log_warning(
-                "HTTP MCP authentication is disabled. Put the endpoint behind "
-                "a trusted gateway or set MCP_AUTH_MODE=oidc."
+                "HTTP MCP authentication is disabled; every caller acts as the "
+                "CANVAS_API_TOKEN account. Put the endpoint behind a trusted "
+                "gateway or set MCP_AUTH_MODE=canvas."
             )
-        log_info("Canvas credentials: per-request via X-Canvas-Token / X-Canvas-URL, or .env")
     else:
         log_info(f"Starting Canvas MCP server with API URL: {config.canvas_api_url}")
 
@@ -388,12 +356,10 @@ def main() -> None:
 
 
 def _run_http_server(mcp: FastMCP) -> None:
-    """Run the MCP server with HTTP transport and credential middleware."""
+    """Run the MCP server with the streamable HTTP transport."""
     import uvicorn
 
-    # Get the Starlette app from FastMCP, then wrap with credential middleware
-    starlette_app = mcp.streamable_http_app()
-    app = CanvasCredentialMiddleware(starlette_app)
+    app = mcp.streamable_http_app()
 
     config = uvicorn.Config(
         app,
